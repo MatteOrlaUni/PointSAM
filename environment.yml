@@ -1,0 +1,33 @@
+# Creazione ambiente: mamba env create -f environment.yml
+
+name: pointsam
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch=2.2.0
+  - torchvision=0.17.0
+  - pytorch-cuda=12.1
+  - cuda-toolkit=12.1
+  - cuda-nvcc=12.1
+  - gxx_linux-64=9.3.0
+  - hydra-core
+  - pip
+  - pip:
+    - timm>=0.9.0
+    - flask
+    - flask-cors
+    - accelerate
+    - safetensors
+    - open3d
+
+# ==============================================================================
+#
+# conda activate pointsam
+# pip install -e .
+# python -c "import torch; print('cuda:', torch.version.cuda); print('gpu:', torch.cuda.is_available()); import torch.utils.cpp_extension as c; print('cuda_home:', c.CUDA_HOME)"
+# 
+# ==============================================================================
