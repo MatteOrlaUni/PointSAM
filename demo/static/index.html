@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="it">
 <head>
     <meta charset="UTF-8">
-    <title>Directory Browser</title>
+    <title>PointSAM — Segmentazione Tronchi</title>
     <link rel="stylesheet" href="/static/style.css">
     <script type="importmap"> 
         { 
@@ -18,11 +18,31 @@
 <div id="container">
     <div id="sidebar">
         <div id="tool-box">
-            <button id="annotate-positive">Positive Prompt</button>
-            <button id="annotate-negative">Negative Prompt</button>
-            <button id="annotate-next">Next Mask</button>
-            <button id="save-result">Save Annotation</button>
-            <button id="clear-result">Clear Annotation</button>
+            <h3 style="margin:0 0 12px 0; color:#eee; font-size:14px;">PointSAM × PointCloud</h3>
+
+            <!-- Segmentazione automatica (sostituisce il click) -->
+            <button id="btn-segment">▶ Segmenta Tronchi</button>
+
+            <!-- Utility -->
+            <button id="btn-clear">✕ Reset Visualizzazione</button>
+            <button id="btn-save">💾 Salva Risultati</button>
+
+            <!-- Barra di stato -->
+            <div id="status" style="
+                margin-top: 16px;
+                padding: 8px;
+                background: #1a1a2e;
+                border-radius: 4px;
+                color: #adf;
+                font-size: 12px;
+                word-break: break-word;
+            ">In attesa...</div>
+
+            <!-- Legenda colori maschere -->
+            <div style="margin-top:16px; font-size:11px; color:#888;">
+                <div>● Giallo = punto prompt</div>
+                <div>● Colori = tronchi segmentati</div>
+            </div>
         </div>
     </div>
     <div id="preview">
@@ -30,11 +50,6 @@
     </div>
     </div>
 </div>
-<script type="module">
-    function test() {
-        console.log("test");
-    }
-</script>
 <script type="module" src="/static/viewer.js"></script>
 <script type="module" src="/static/annotate.js"></script>
 </body>

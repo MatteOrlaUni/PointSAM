@@ -27,7 +27,9 @@ async function main() {
   // Change different point cloud here, all demo point clouds are saved in static/models
   // ===================================================================================
 
-  await loadPointCloud("/pointcloud/089_0.ply");
+  // La nuvola è sempre quella caricata dal LAS passato a --las.
+  // Il backend la espone sull'endpoint fisso /pointcloud (senza path).
+  await loadPointCloud("/pointcloud");
 
   function animate() {
     requestAnimationFrame(animate);

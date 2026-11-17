@@ -1,67 +1,126 @@
+"""
+app.py — PointSAM Demo Backend (integrazione PointCloud)
+---------------------------------------------------------
+Avvio:
+    python demo/app.py --las /path/to/nuvola.las \\
+                       --sam_checkpoint ./demo/model/sam_vit_h_4b8939.pth \\
+                       --ckpt_path ./pretrained/model.safetensors
+
+Flusso all'avvio:
+  1. Pipeline PointCloud:
+       - Generazione vista nadirale MAGMA dal file .LAS
+       - SAM Classic sull'immagine MAGMA → maschere 2D
+       - Calcolo centroide per maschera → back-projection → punto 3D
+  2. Preparazione tensori PointSAM dalla nuvola del LAS (con normalizzazione)
+  3. Avvio server Flask:
+       GET  /             → index.html (visualizzazione browser)
+       GET  /pointcloud   → nuvola normalizzata (xyz + rgb) per il viewer Three.js
+       POST /segment_all  → esegue PointSAM su tutti i tronchi, restituisce tutte le maschere
+       POST /clear        → reset stato
+       POST /save         → salva risultati su disco
+
+Modifica la logica di rilevamento tronchi in:
+    demo/prompt_generator.py
+    demo/trunk_detector/las_extractor.py
+    demo/trunk_detector/sam_detector.py
+"""
+
 import hydra
 from omegaconf import OmegaConf
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from utils import load_ply
 import numpy as np
 import torch
 import os
-import numpy as np
 import argparse
-from pc_sam.model.pc_sam import PointCloudSAM
-from pc_sam.utils.torch_utils import replace_with_fused_layernorm
-from pc_sam.model.loss import compute_iou
 from safetensors.torch import load_model
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--host", type=str, default="localhost")
-parser.add_argument("--port", type=int, default=5000)
-parser.add_argument("--checkpoint", type=str, default="pretrained/model.safetensors")
-parser.add_argument("--pointcloud", type=str, default="temp3.ply")
-parser.add_argument("--config", type=str, default="large", help="path to config file")
-parser.add_argument("--config_dir", type=str, default="../configs")
-parser.add_argument("--ckpt_path", type=str, default="./pretrained/model.safetensors")
-args = parser.parse_args()
+from pc_sam.model.pc_sam import PointCloudSAM
+from pc_sam.utils.torch_utils import replace_with_fused_layernorm
 
-# PCSAM variables
-pc_xyz, pc_rgb = None, None
-prompts, labels = [], []
-prompt_mask = None
-obj_path = None
-output_dir = "results"
-segment_mask = None
-masks = []
-
-# Flask Backend
-app = Flask(__name__, static_folder="static")
-CORS(
-    app, origins=f"{args.host}:{args.port}", allow_headers="Access-Control-Allow-Origin"
+# ---------------------------------------------------------------------------- #
+# Pipeline automatica di rilevamento tronchi + generazione prompt
+# Modifica la logica di selezione del punto in:  demo/prompt_generator.py
+#                                                demo/trunk_detector/
+# ---------------------------------------------------------------------------- #
+from prompt_generator import (
+    run_trunk_detection_pipeline,
+    build_pc_tensors,
+    project_trunk_point_to_normalized,
 )
 
-# change "./pretrained/model.safetensors" to the path of the checkpoint
+# ============================================================
+# ARGOMENTI
+# ============================================================
+parser = argparse.ArgumentParser(description="PointSAM Demo — integrazione PointCloud")
+parser.add_argument("--host",           type=str, default="localhost")
+parser.add_argument("--port",           type=int, default=5000)
+parser.add_argument("--las",            type=str, required=True,
+                    help="Percorso del file .las di input")
+parser.add_argument("--sam_checkpoint", type=str,
+                    default="./demo/model/sam_vit_h_4b8939.pth",
+                    help="Checkpoint SAM ViT-H per il rilevamento 2D dei tronchi")
+parser.add_argument("--config",         type=str, default="large",
+                    help="Nome configurazione PointSAM (cartella configs/)")
+parser.add_argument("--config_dir",     type=str, default="../configs")
+parser.add_argument("--ckpt_path",      type=str,
+                    default="./pretrained/model.safetensors",
+                    help="Checkpoint PointSAM")
+parser.add_argument("--data_dir",       type=str, default="./demo/data",
+                    help="Directory per i file intermedi della pipeline PointCloud")
+parser.add_argument("--output_dir",     type=str, default="./results")
+args = parser.parse_args()
 
-# ---------------------------------------------------------------------------- #
-# Load configuration
-# ---------------------------------------------------------------------------- #
+# ============================================================
+# STEP 1 — Pipeline PointCloud (pesante, eseguita una sola volta all'avvio)
+# ============================================================
+print("\n" + "=" * 60)
+print("AVVIO PIPELINE TRUNK DETECTION (PointCloud → PointSAM)")
+print("=" * 60)
+
+points_original, colors_rgb, trunk_points_original = run_trunk_detection_pipeline(
+    las_path=args.las,
+    data_dir=args.data_dir,
+    sam_checkpoint=args.sam_checkpoint,
+)
+
+# ============================================================
+# STEP 2 — Preparazione nuvola per PointSAM (normalizzazione)
+# ============================================================
+print("\n[App] Preparazione tensori PointSAM dalla nuvola LAS...")
+pc_xyz, pc_rgb, _shift, _scale = build_pc_tensors(points_original, colors_rgb)
+
+# Pre-calcola tutti i prompt normalizzati
+trunk_prompts = [
+    project_trunk_point_to_normalized(pt, _shift, _scale)
+    for pt in trunk_points_original
+]
+print(f"[App] {len(trunk_prompts)} prompt pronti per PointSAM.")
+
+# Stato per salvataggio
+output_dir = args.output_dir
+all_segment_masks = []   # List[np.ndarray] — una maschera per tronco
+
+# ============================================================
+# STEP 3 — Caricamento PointSAM
+# ============================================================
+print("\n[App] Caricamento modello PointSAM...")
 with hydra.initialize(args.config_dir, version_base=None):
     cfg = hydra.compose(config_name=args.config)
     OmegaConf.resolve(cfg)
-    # print(OmegaConf.to_yaml(cfg))
 
+sam_model: PointCloudSAM = hydra.utils.instantiate(cfg.model)
+sam_model.apply(replace_with_fused_layernorm)
+load_model(sam_model, args.ckpt_path)
+sam_model = sam_model.cuda()
+sam_model.eval()
+print("[App] PointSAM caricato.")
 
-# ---------------------------------------------------------------------------- #
-# Setup model
-# ---------------------------------------------------------------------------- #
-model = hydra.utils.instantiate(cfg.model)
-model.apply(replace_with_fused_layernorm)
-
-# ---------------------------------------------------------------------------- #
-# Load pre-trained model
-# ---------------------------------------------------------------------------- #
-load_model(model, args.ckpt_path)
-model = model.cuda()  # SPINGI IL MODELLO SULLA GPU
-sam = model
-sam.eval()
+# ============================================================
+# FLASK APP
+# ============================================================
+app = Flask(__name__, static_folder="static")
+CORS(app, origins=f"{args.host}:{args.port}", allow_headers="Access-Control-Allow-Origin")
 
 
 @app.route("/")
@@ -74,136 +133,87 @@ def static_server(path):
     return app.send_static_file(path)
 
 
-@app.route("/mesh/<path:path>")
-def mesh_server(path):
-    # path = f"/home/yuchen/workspace/annotator_3d/src/static/models/{path}"
-    # print(path)
-    # path = "/home/yuchen/workspace/annotator_3d/src/static/models/Rhino/White Rhino.obj"
-    path = f"models/{path}"
-    print(path)
-    return app.send_static_file(path)
+@app.route("/pointcloud")
+def pointcloud_endpoint():
+    """Restituisce la nuvola normalizzata (coordinate + colori) per il viewer Three.js."""
+    xyz_flat = pc_xyz[0].cpu().numpy().flatten().tolist()
+    rgb_flat = pc_rgb[0].cpu().numpy().flatten().tolist()
+    return jsonify({"xyz": xyz_flat, "rgb": rgb_flat})
 
 
-@app.route("/sampled_pointcloud", methods=["POST"])
-def sampled_pc():
-    request_data = request.get_json()
-    points = request_data["points"].values()
-    points = np.array(list(points)).reshape(-1, 3)
-    colors = request_data["colors"].values()
-    colors = np.array(list(colors)).reshape(-1, 3)
+@app.route("/segment_all", methods=["POST"])
+def segment_all():
+    """Esegue PointSAM per tutti i tronchi rilevati e restituisce le maschere.
 
-    global pc_xyz, pc_rgb
-    pc_xyz, pc_rgb = (
-        torch.from_numpy(points).cuda().float(),
-        torch.from_numpy(colors).cuda().float(),
-    )
-    pc_xyz, pc_rgb = pc_xyz.unsqueeze(0), pc_rgb.unsqueeze(0)
+    Questo endpoint sostituisce il vecchio /segment basato sul click utente.
+    Non richiede body JSON: i prompt sono già stati calcolati dalla pipeline
+    all'avvio e sono disponibili in trunk_prompts.
 
-    response = "success"
-    return jsonify({"response": response})
+    Risposta JSON:
+        {
+            "num_trunks": int,
+            "masks": [ [bool, ...], ... ]   # una lista per tronco
+        }
+    """
+    global all_segment_masks
+    all_segment_masks = []
+
+    results = []
+    print(f"\n[Segment] Avvio segmentazione PointSAM su {len(trunk_prompts)} tronchi...")
+
+    for i, (prompt_point, prompt_label) in enumerate(trunk_prompts):
+        prompt_points = torch.tensor([[prompt_point]], dtype=torch.float32).cuda()  # [1, 1, 3]
+        prompt_labels = torch.tensor([[prompt_label]], dtype=torch.long).cuda()      # [1, 1]
+
+        with torch.no_grad():
+            logits, scores = sam_model.predict_masks(
+                pc_xyz, pc_rgb,
+                prompt_points, prompt_labels,
+                None,   # nessuna prompt_mask iniziale
+                True,   # multimask_output
+            )
+
+        best_idx = torch.argmax(scores[0])
+        mask = (logits[0][best_idx] > 0).cpu().numpy()
+        all_segment_masks.append(mask)
+
+        print(f"[Segment] Tronco {i + 1}/{len(trunk_prompts)} | punti segmentati: {mask.sum()}")
+        results.append(mask.tolist())
+
+    return jsonify({"num_trunks": len(results), "masks": results})
 
 
-@app.route("/pointcloud/<path:path>")
-def pointcloud_server(path):
-    path = args.pointcloud
-    global obj_path
-    obj_path = path
-    points = load_ply(f"./demo/static/models/{path}")
-    xyz = points[:, :3]
-    rgb = points[:, 3:6] / 255
-    # print(rgb.max())
-    # indices = np.random.choice(xyz.shape[0], 30000, replace=False)
-    # xyz = xyz[indices]
-    # rgb = rgb[indices]
-
-    # normalize
-    shift = xyz.mean(0)
-    scale = np.linalg.norm(xyz - shift, axis=-1).max()
-    xyz = (xyz - shift) / scale
-
-    # set pcsam variables
-    global pc_xyz, pc_rgb
-    pc_xyz, pc_rgb = (
-        torch.from_numpy(xyz).cuda().float(),
-        torch.from_numpy(rgb).cuda().float(),
-    )
-    pc_xyz, pc_rgb = pc_xyz.unsqueeze(0), pc_rgb.unsqueeze(0)
-
-    # flatten
-    xyz = xyz.flatten()
-    rgb = rgb.flatten()
-
-    return jsonify({"xyz": xyz.tolist(), "rgb": rgb.tolist()})
+@app.route("/prompts")
+def get_prompts():
+    """Restituisce i punti prompt 3D normalizzati (utile per visualizzarli nel browser)."""
+    return jsonify({
+        "prompts": [{"point": pt, "label": lbl} for pt, lbl in trunk_prompts]
+    })
 
 
 @app.route("/clear", methods=["POST"])
 def clear():
-    global prompts, labels, prompt_mask, segment_mask
-    prompts, labels = [], []
-    prompt_mask = None
-    segment_mask = None
-    return jsonify({"status": "cleared"})
-
-
-@app.route("/next", methods=["POST"])
-def next():
-    global prompts, labels, segment_mask, masks, prompt_mask
-    masks.append(segment_mask.cpu().numpy())
-    prompts, labels = [], []
-    prompt_mask = None
+    global all_segment_masks
+    all_segment_masks = []
     return jsonify({"status": "cleared"})
 
 
 @app.route("/save", methods=["POST"])
 def save():
     os.makedirs(output_dir, exist_ok=True)
-    global pc_xyz, pc_rgb, segment_mask, obj_path, masks
     xyz = pc_xyz[0].cpu().numpy()
     rgb = pc_rgb[0].cpu().numpy()
-    masks = np.stack(masks)
-    obj_path = obj_path.split(".")[0]
-    np.save(f"{output_dir}/{obj_path}.npy", {"xyz": xyz, "rgb": rgb, "mask": masks})
-    global prompts, labels, prompt_mask
-    prompts, labels = [], []
-    prompt_mask = None
-    segment_mask = None
-    return jsonify({"status": "saved"})
-
-
-@app.route("/segment", methods=["POST"])
-def segment():
-    request_data = request.get_json()
-    prompt_point = request_data["prompt_point"]
-    prompt_label = request_data["prompt_label"]
-
-    # append prompt
-    global prompts, labels, prompt_mask
-    prompts.append(prompt_point)
-    labels.append(prompt_label)
-
-    prompt_points = torch.from_numpy(np.array(prompts)).cuda().float()[None, ...]
-    prompt_labels = torch.from_numpy(np.array(labels)).cuda()[None, ...]
-
-    data = {
-        "points": pc_xyz,
-        "rgb": pc_rgb,
-        "prompt_points": prompt_points,
-        "prompt_labels": prompt_labels,
-        "prompt_mask": prompt_mask,
-    }
-    with torch.no_grad():
-        logits, scores = sam.predict_masks(
-            pc_xyz, pc_rgb, prompt_points, prompt_labels, prompt_mask, prompt_mask is None
-        )
-    
-    best_idx = torch.argmax(scores[0])
-    prompt_mask = logits[0][best_idx][None, ...]
-    
-    global segment_mask
-    segment_mask = return_mask = logits[0][best_idx] > 0
-    
-    return jsonify({"seg": return_mask.cpu().numpy().tolist()})
+    if all_segment_masks:
+        masks_np = np.stack(all_segment_masks)
+        las_name = os.path.splitext(os.path.basename(args.las))[0]
+        out_path = os.path.join(output_dir, f"{las_name}_segmented.npy")
+        np.save(out_path, {"xyz": xyz, "rgb": rgb, "masks": masks_np})
+        print(f"[Save] Risultati salvati in {out_path}")
+        return jsonify({"status": "saved", "path": out_path, "num_masks": len(masks_np)})
+    else:
+        return jsonify({"status": "nothing_to_save"})
 
 
 if __name__ == "__main__":
-    app.run(host=f"{args.host}", port=f"{args.port}", debug=True)
+    print(f"\n[App] Server Flask avviato su http://{args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, debug=False)
