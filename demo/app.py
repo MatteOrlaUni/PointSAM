@@ -17,10 +17,22 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--host", type=str, default="localhost")
 parser.add_argument("--port", type=int, default=5000)
 parser.add_argument("--checkpoint", type=str, default="pretrained/model.safetensors")
-parser.add_argument("--pointcloud", type=str, default="temp3.ply")
+parser.add_argument("--pointcloud", type=str, default="temp.ply")
 parser.add_argument("--config", type=str, default="large", help="path to config file")
 parser.add_argument("--config_dir", type=str, default="../configs")
 parser.add_argument("--ckpt_path", type=str, default="./pretrained/model.safetensors")
+parser.add_argument(
+    "--max_points",
+    type=int,
+    default=50000,
+    help="Numero massimo di punti consentiti per la nuvola (sfoltimento se superato; <= 0 per disabilitare, default: 50000)",
+)
+parser.add_argument(
+    "--voxel_size",
+    type=float,
+    default=None,
+    help="Dimensione del voxel per eventuale voxel downsampling preliminare (opzionale)",
+)
 args = parser.parse_args()
 
 # PCSAM variables
@@ -98,6 +110,7 @@ def sampled_pc():
         torch.from_numpy(colors).cuda().float(),
     )
     pc_xyz, pc_rgb = pc_xyz.unsqueeze(0), pc_rgb.unsqueeze(0)
+    sam.set_point_cloud(pc_xyz, pc_rgb)
 
     response = "success"
     return jsonify({"response": response})
@@ -108,13 +121,14 @@ def pointcloud_server(path):
     path = args.pointcloud
     global obj_path
     obj_path = path
-    points = load_ply(f"./demo/static/models/{path}")
+    max_pts = args.max_points if args.max_points and args.max_points > 0 else None
+    points = load_ply(
+        f"./demo/static/models/{path}",
+        max_points=max_pts,
+        voxel_size=args.voxel_size,
+    )
     xyz = points[:, :3]
     rgb = points[:, 3:6] / 255
-    # print(rgb.max())
-    # indices = np.random.choice(xyz.shape[0], 30000, replace=False)
-    # xyz = xyz[indices]
-    # rgb = rgb[indices]
 
     # normalize
     shift = xyz.mean(0)
@@ -128,6 +142,11 @@ def pointcloud_server(path):
         torch.from_numpy(rgb).cuda().float(),
     )
     pc_xyz, pc_rgb = pc_xyz.unsqueeze(0), pc_rgb.unsqueeze(0)
+
+    # Pre-calcola le feature dell'encoder 3D in VRAM
+    print(f"[INFO Caching] Pre-calcolo dell'Encoder 3D in corso per {xyz.shape[0]} punti...")
+    sam.set_point_cloud(pc_xyz, pc_rgb)
+    print("[INFO Caching] Feature 3D pronte in VRAM! I prompt saranno elaborati all'istante.")
 
     # flatten
     xyz = xyz.flatten()

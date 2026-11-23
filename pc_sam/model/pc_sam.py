@@ -33,30 +33,76 @@ class PointCloudSAM(nn.Module):
         self.mask_decoder = mask_decoder
         self.prompt_iters = prompt_iters
         self.enable_mask_refinement_iterations = enable_mask_refinement_iterations
+        self._cached_pc = None
+
+    def set_point_cloud(self, coords: torch.Tensor, features: torch.Tensor):
+        """Pre-calcola e memorizza in cache le feature estratte dal PointCloudEncoder per la nuvola corrente."""
+        with torch.no_grad():
+            pc_embeddings, patches = self.pc_encoder(coords, features)
+            centers = patches["centers"]  # [B, num_patches, 3]
+            knn_idx = patches["knn_idx"]  # [B, N, K]
+            aux_inputs = AuxInputs(coords=coords, features=features, centers=centers)
+            pc_pe = self.point_encoder.pe_layer(centers)
+
+        self._cached_pc = {
+            "coords": coords,
+            "features": features,
+            "pc_embeddings": pc_embeddings,
+            "centers": centers,
+            "knn_idx": knn_idx,
+            "aux_inputs": aux_inputs,
+            "pc_pe": pc_pe,
+        }
+
+    def reset_point_cloud(self):
+        """Svuota la cache delle feature della nuvola di punti."""
+        self._cached_pc = None
 
     def predict_masks(
         self,
-        coords: torch.Tensor,
-        features: torch.Tensor,
-        prompt_coords: torch.Tensor,
-        prompt_labels: torch.Tensor,
+        coords: torch.Tensor = None,
+        features: torch.Tensor = None,
+        prompt_coords: torch.Tensor = None,
+        prompt_labels: torch.Tensor = None,
         prompt_masks: torch.Tensor = None,
         multimask_output: bool = True,
     ):
         """Predict masks given point prompts.
-
-        Args:
-            coords: [B, N, 3]. Point cloud coordinates, normalized to [-1, 1].
-            features: [B, N, F]. Point cloud features.
+        Se le feature della nuvola sono già presenti in cache (tramite set_point_cloud o chiamata precedente),
+        riutilizza quelle evitando il ricalcolo dell'encoder 3D.
         """
-        # pc_embeddings: [B, num_patches, D]
-        pc_embeddings, patches = self.pc_encoder(coords, features)
-        centers = patches["centers"]  # [B, num_patches, 3]
-        knn_idx = patches["knn_idx"]  # [B, N, K]
-        aux_inputs = AuxInputs(coords=coords, features=features, centers=centers)
+        use_cache = False
+        if hasattr(self, "_cached_pc") and self._cached_pc is not None:
+            if coords is None or coords is self._cached_pc["coords"]:
+                use_cache = True
+            elif (
+                coords.shape == self._cached_pc["coords"].shape
+                and torch.equal(coords[0, :min(10, coords.shape[1])], self._cached_pc["coords"][0, :min(10, coords.shape[1])])
+            ):
+                use_cache = True
 
-        # [B, num_patches, D]
-        pc_pe = self.point_encoder.pe_layer(centers)
+        if use_cache:
+            coords = self._cached_pc["coords"]
+            pc_embeddings = self._cached_pc["pc_embeddings"]
+            centers = self._cached_pc["centers"]
+            knn_idx = self._cached_pc["knn_idx"]
+            aux_inputs = self._cached_pc["aux_inputs"]
+            pc_pe = self._cached_pc["pc_pe"]
+        else:
+            pc_embeddings, patches = self.pc_encoder(coords, features)
+            centers = patches["centers"]  # [B, num_patches, 3]
+            knn_idx = patches["knn_idx"]  # [B, N, K]
+            aux_inputs = AuxInputs(coords=coords, features=features, centers=centers)
+            pc_pe = self.point_encoder.pe_layer(centers)
+            self._cached_pc = {
+                "coords": coords,
+                "features": features,
+                "pc_embeddings": pc_embeddings,
+                "centers": centers,
+                "knn_idx": knn_idx,
+                "aux_inputs": aux_inputs,
+                "pc_pe": pc_pe,
+            }
 
         # [B * M, num_queries, D]
         sparse_embeddings = self.point_encoder(prompt_coords, prompt_labels)
@@ -212,30 +258,76 @@ class PointCloudSAMNN(nn.Module):
         self.mask_decoder = mask_decoder
         self.prompt_iters = prompt_iters
         self.enable_mask_refinement_iterations = enable_mask_refinement_iterations
+        self._cached_pc = None
+
+    def set_point_cloud(self, coords: torch.Tensor, features: torch.Tensor):
+        """Pre-calcola e memorizza in cache le feature estratte dal PointCloudEncoder per la nuvola corrente."""
+        with torch.no_grad():
+            pc_embeddings, patches = self.pc_encoder(coords, features)
+            centers = patches["centers"]  # [B, num_patches, 3]
+            knn_idx = patches["knn_idx"]  # [B, N, K]
+            aux_inputs = AuxInputs(coords=coords, features=features, centers=centers)
+            pc_pe = self.point_encoder.pe_layer(centers)
+
+        self._cached_pc = {
+            "coords": coords,
+            "features": features,
+            "pc_embeddings": pc_embeddings,
+            "centers": centers,
+            "knn_idx": knn_idx,
+            "aux_inputs": aux_inputs,
+            "pc_pe": pc_pe,
+        }
+
+    def reset_point_cloud(self):
+        """Svuota la cache delle feature della nuvola di punti."""
+        self._cached_pc = None
 
     def predict_masks(
         self,
-        coords: torch.Tensor,
-        features: torch.Tensor,
-        prompt_coords: torch.Tensor,
-        prompt_labels: torch.Tensor,
+        coords: torch.Tensor = None,
+        features: torch.Tensor = None,
+        prompt_coords: torch.Tensor = None,
+        prompt_labels: torch.Tensor = None,
         prompt_masks: torch.Tensor = None,
         multimask_output: bool = True,
     ):
         """Predict masks given point prompts.
-
-        Args:
-            coords: [B, N, 3]. Point cloud coordinates, normalized to [-1, 1].
-            features: [B, N, F]. Point cloud features.
+        Se le feature della nuvola sono già presenti in cache (tramite set_point_cloud o chiamata precedente),
+        riutilizza quelle evitando il ricalcolo dell'encoder 3D.
         """
-        # pc_embeddings: [B, num_patches, D]
-        pc_embeddings, patches = self.pc_encoder(coords, features)
-        centers = patches["centers"]  # [B, num_patches, 3]
-        knn_idx = patches["knn_idx"]  # [B, N, K]
-        aux_inputs = AuxInputs(coords=coords, features=features, centers=centers)
+        use_cache = False
+        if hasattr(self, "_cached_pc") and self._cached_pc is not None:
+            if coords is None or coords is self._cached_pc["coords"]:
+                use_cache = True
+            elif (
+                coords.shape == self._cached_pc["coords"].shape
+                and torch.equal(coords[0, :min(10, coords.shape[1])], self._cached_pc["coords"][0, :min(10, coords.shape[1])])
+            ):
+                use_cache = True
 
-        # [B, num_patches, D]
-        pc_pe = self.point_encoder.pe_layer(centers)
+        if use_cache:
+            coords = self._cached_pc["coords"]
+            pc_embeddings = self._cached_pc["pc_embeddings"]
+            centers = self._cached_pc["centers"]
+            knn_idx = self._cached_pc["knn_idx"]
+            aux_inputs = self._cached_pc["aux_inputs"]
+            pc_pe = self._cached_pc["pc_pe"]
+        else:
+            pc_embeddings, patches = self.pc_encoder(coords, features)
+            centers = patches["centers"]  # [B, num_patches, 3]
+            knn_idx = patches["knn_idx"]  # [B, N, K]
+            aux_inputs = AuxInputs(coords=coords, features=features, centers=centers)
+            pc_pe = self.point_encoder.pe_layer(centers)
+            self._cached_pc = {
+                "coords": coords,
+                "features": features,
+                "pc_embeddings": pc_embeddings,
+                "centers": centers,
+                "knn_idx": knn_idx,
+                "aux_inputs": aux_inputs,
+                "pc_pe": pc_pe,
+            }
 
         # [B * M, num_queries, D]
         sparse_embeddings = self.point_encoder(prompt_coords, prompt_labels)
