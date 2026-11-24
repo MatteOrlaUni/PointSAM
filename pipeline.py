@@ -171,10 +171,20 @@ def proietta_2d(pcd: o3d.geometry.PointCloud, risoluzione: int = RISOLUZIONE_PRO
 
     # Mappa di calore Z (più alto = più luminoso) dipinta dal basso verso l'alto
     z_norm_uint8 = ((z - z_min) / (z_max - z_min + 1e-9) * 255).astype(np.uint8)
-    immagine = np.zeros((altezza, larghezza, 3), dtype=np.uint8)
+    immagine = np.full((altezza, larghezza, 3), 255, dtype=np.uint8)
     ordine_z = np.argsort(z_norm_uint8)
     colori_jet = cv2.applyColorMap(z_norm_uint8, cv2.COLORMAP_MAGMA).squeeze()
-    immagine[v[ordine_z], u[ordine_z]] = colori_jet[ordine_z]
+
+    # Disegna ogni punto con raggio > 1 per renderli ben visibili su sfondo bianco
+    raggio_punto = max(1, int(risoluzione / 500))
+    for idx_pt in ordine_z:
+        pt_u = int(u[idx_pt])
+        pt_v = int(v[idx_pt])
+        colore = (int(colori_jet[idx_pt][0]), int(colori_jet[idx_pt][1]), int(colori_jet[idx_pt][2]))
+        if raggio_punto > 1:
+            cv2.circle(immagine, (pt_u, pt_v), raggio_punto, colore, -1)
+        else:
+            immagine[pt_v, pt_u] = colore
 
     # KDTree per ritrovare il punto 3D più vicino dato un pixel 2D
     kdtree_2d = KDTree(np.vstack((u, v)).T.astype(np.float32))
@@ -405,21 +415,30 @@ def _snapshot_matplotlib(
     import matplotlib.pyplot as plt
 
     xyz = np.asarray(pcd_originale.points)
+    n_punti = len(xyz)
+    # Calcola una dimensione del punto adattiva in base al numero di punti
+    if n_punti <= 15000:
+        point_size = 12.0
+    elif n_punti <= 50000:
+        point_size = 6.0
+    else:
+        point_size = 3.0
+
     dpi = 100
     fig, ax = plt.subplots(figsize=(larghezza / dpi, altezza / dpi), dpi=dpi)
-    ax.set_facecolor("#111111")
-    fig.patch.set_facecolor("#111111")
+    ax.set_facecolor("#FFFFFF")
+    fig.patch.set_facecolor("#FFFFFF")
     # Vista dall'alto (XY), ordinata per Z crescente per sovrascrivere con i punti più alti
     ordine_z = np.argsort(xyz[:, 2])
     ax.scatter(
         xyz[ordine_z, 0], xyz[ordine_z, 1],
         c=colori_out[ordine_z],
-        s=0.5, linewidths=0,
+        s=point_size, linewidths=0,
     )
     ax.set_aspect("equal")
     ax.axis("off")
     plt.tight_layout(pad=0)
-    plt.savefig(percorso, dpi=dpi, bbox_inches="tight", pad_inches=0)
+    plt.savefig(percorso, dpi=dpi, bbox_inches="tight", pad_inches=0, facecolor="#FFFFFF")
     plt.close(fig)
 
 
@@ -432,11 +451,18 @@ def _prova_visualizer_o3d(pcd_vis: o3d.geometry.PointCloud, percorso: str, largh
         vis = o3d.visualization.Visualizer()
         vis.create_window(visible=False, width=larghezza, height=altezza)
         vis.add_geometry(pcd_vis)
+        
+        opt = vis.get_render_option()
+        if opt is not None:
+            opt.background_color = np.asarray([1.0, 1.0, 1.0])
+            opt.point_size = 4.0
+
         ctr = vis.get_view_control()
-        ctr.set_front([0, 0, 1])
-        ctr.set_up([0, 1, 0])
-        ctr.set_lookat(np.asarray(pcd_vis.points).mean(axis=0))
-        ctr.set_zoom(0.5)
+        if ctr is not None:
+            ctr.set_front([0, 0, 1])
+            ctr.set_up([0, 1, 0])
+            ctr.set_lookat(np.asarray(pcd_vis.points).mean(axis=0))
+            ctr.set_zoom(0.5)
         vis.poll_events()
         vis.update_renderer()
         vis.capture_screen_image(percorso)
@@ -457,10 +483,10 @@ def salva_snapshot_tronco(
 ):
     """
     Salva uno snapshot 3D con il tronco segmentato evidenziato nel suo colore
-    e il resto della scena in grigio neutro.
+    e il resto della scena in grigio neutro chiaro.
     Tenta Open3D Visualizer; se non disponibile (WSL headless) usa matplotlib.
     """
-    colori_out = np.ones((len(pcd_originale.points), 3)) * 0.3  # grigio
+    colori_out = np.ones((len(pcd_originale.points), 3)) * 0.75  # grigio chiaro su sfondo bianco
     colori_out[maschera] = colore
 
     pcd_vis = o3d.geometry.PointCloud()
@@ -482,10 +508,10 @@ def salva_scena_completa(
 ):
     """
     Salva una vista 3D con tutti i tronchi distinguibili da colori diversi
-    e il terreno/sfondo in grigio.
+    e il terreno/sfondo in grigio chiaro.
     Tenta Open3D Visualizer; se non disponibile (WSL headless) usa matplotlib.
     """
-    colori_out = np.ones((len(pcd_originale.points), 3)) * 0.25  # grigio scuro
+    colori_out = np.ones((len(pcd_originale.points), 3)) * 0.75  # grigio chiaro su sfondo bianco
     for i, maschera in enumerate(maschere):
         colore = TAVOLOZZA_COLORI[i % len(TAVOLOZZA_COLORI)]
         colori_out[maschera] = colore
