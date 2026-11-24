@@ -1,1 +1,0 @@
-Ottimizzazione del file tree. Implementazione Caching dell'Encoder

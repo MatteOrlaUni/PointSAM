@@ -37,20 +37,32 @@ from hydra.core.global_hydra import GlobalHydra
 #  CONFIGURAZIONE - Modifica questi valori per personalizzare l'esecuzione
 # ==============================================================================
 
-# Soglia massima di punti per la nuvola (<=0 per disabilitare lo sfoltimento)
-MAX_POINTS = 50000
+# Soglia massima di punti per la nuvola (<=0 per attivare il calcolo ADATTIVO automatico)
+MAX_POINTS = 0
 
-# Dimensione voxel per downsampling geometrico (None per disabilitare)
+# Dimensione voxel per downsampling geometrico (None per calcolo automatico adattivo)
 VOXEL_SIZE = None
 
 # Risoluzione pixel dell'immagine 2D generata dalla proiezione nadirale
 RISOLUZIONE_PROIEZIONE = 1024
 
-# Soglia minima di area in pixel per considerare un oggetto rilevato da SAM 2D
-MIN_AREA_MASCHERA = 500
+# Soglia minima di area in percentuale per considerare un tronco (0.4% per scartare frammenti spuri)
+MIN_AREA_PERCENTUALE = 0.004
 
-# Soglia massima di area in pixel (evita maschere enormi che coprono lo sfondo)
-MAX_AREA_MASCHERA_PERCENTUALE = 0.4  # 40% dell'immagine
+# Soglia massima di area in percentuale (15% per consentire tronchi completi anche in viste ravvicinate)
+MAX_AREA_PERCENTUALE = 0.15
+
+# Soglia massima di sovrapposizione consentita tra maschere (NMS: > 0.25 scartata, come PointCloud)
+MAX_OVERLAP_SOGLIA = 0.25
+
+# Soglia minima di elongazione via PCA (rapporto asse lungo / asse corto >= 2.0 per escludere macchie tonde)
+MIN_ELONGAZIONE = 2.0
+
+# Lunghezza fisica minima stimata in metri (adattata anche per tronchetti di piccola taglia >= 35 cm)
+MIN_LUNGHEZZA_METRI = 0.35
+
+# Soglia minima di variazione di quota Z per distinguere tronchi da suolo piatto (come PointCloud)
+MIN_Z_STD = 0.012
 
 # Numero di punti prompt estratti per ogni tronco (non modificare)
 N_PUNTI_PER_TRONCO = 3
@@ -74,13 +86,19 @@ RESULTS_DIR = "results"
 
 def carica_nuvola(percorso: str, max_points: int = MAX_POINTS, voxel_size=VOXEL_SIZE):
     """
-    Carica una nuvola di punti da file .las o .ply, con sfoltimento automatico.
-    Restituisce un open3d.PointCloud con coordinate XYZ e colori RGB [0,1].
+    Carica una nuvola di punti da file .las o .ply con campionamento adattivo e deterministico.
+    Adatta la densità e il numero di punti alle dimensioni reali della scena:
+    - Se max_points <= 0 o None: calcola dinamicamente i punti ottimali (1500 pts/m² di estensione XY, tra 60.000 e 120.000 punti).
+    - Usa voxel downsampling per garantire omogeneità spaziale ed eliminare i buchi tra punti.
+    - Fissa un seed casuale deterministico (seed=42) per garantire risultati identici a parità di dati.
     """
     print(f"\n{'='*60}")
-    print("STEP 1 - Caricamento nuvola di punti")
+    print("STEP 1 - Caricamento e campionamento adattivo della nuvola")
     print(f"{'='*60}")
     print(f"File: {percorso}")
+
+    np.random.seed(42)
+    torch.manual_seed(42)
 
     ext = os.path.splitext(percorso)[1].lower()
 
@@ -99,36 +117,54 @@ def carica_nuvola(percorso: str, max_points: int = MAX_POINTS, voxel_size=VOXEL_
             rgb = np.vstack((r, g, b)).T / scala
             pcd.colors = o3d.utility.Vector3dVector(rgb)
         else:
-            # Nessun colore: usa grigio uniforme
-            pcd.colors = o3d.utility.Vector3dVector(
-                np.ones((len(xyz), 3)) * 0.5
-            )
+            pcd.colors = o3d.utility.Vector3dVector(np.ones((len(xyz), 3)) * 0.5)
 
     elif ext == ".ply":
         pcd = o3d.io.read_point_cloud(percorso)
         if not pcd.has_colors():
-            pcd.colors = o3d.utility.Vector3dVector(
-                np.ones((len(pcd.points), 3)) * 0.5
-            )
+            pcd.colors = o3d.utility.Vector3dVector(np.ones((len(pcd.points), 3)) * 0.5)
     else:
         raise ValueError(f"Formato file non supportato: {ext}. Usa .las o .ply")
 
     n_originale = len(pcd.points)
-    print(f"Punti caricati: {n_originale:,}")
+    bbox = pcd.get_axis_aligned_bounding_box()
+    extent = bbox.get_extent()
+    dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
+    area_scena = dx * dy
 
-    # Sfoltimento con voxel downsampling
+    print(f"Punti caricati: {n_originale:,}")
+    print(f"Dimensioni scena: {dx:.2f}m x {dy:.2f}m x {dz:.2f}m (Area piano XY: {area_scena:.1f} m²)")
+
+    # 1. Calcolo adattivo del numero di punti target in base alle dimensioni reali della scena
+    if max_points is None or max_points <= 0:
+        # Per scene piccole (< 5 m²) mantiene densità fine, per scene grandi adatta proporzionalmente
+        if area_scena < 5.0:
+            target_pts = int(np.clip(n_originale, 40000, 80000))
+        else:
+            target_pts = int(np.clip(area_scena * 1500, 60000, 120000))
+        print(f"Campionamento ADATTIVO: densità target calibrata -> budget: {target_pts:,} punti")
+    else:
+        target_pts = max_points
+        print(f"Campionamento impostato da utente: {target_pts:,} punti massimi")
+
+    # 2. Voxel Downsampling preliminare geometricamente omogeneo
     if voxel_size is not None and voxel_size > 0:
-        print(f"Voxel downsampling (voxel_size={voxel_size})...")
-        pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+        v_size = voxel_size
+    else:
+        # Voxel size stimato per raggiungere la densità target preservando la geometria dei cilindri
+        v_size = float(np.clip(np.sqrt(area_scena / max(1, target_pts)), 0.005, 0.035))
+
+    if n_originale > target_pts:
+        print(f"Voxel downsampling omogeneo (voxel_size = {v_size*100:.1f} cm)...")
+        pcd = pcd.voxel_down_sample(voxel_size=v_size)
         print(f"Punti dopo voxel downsampling: {len(pcd.points):,}")
 
-    # Sfoltimento numerico casuale
-    if max_points is not None and max_points > 0 and len(pcd.points) > max_points:
-        print(f"Sfoltimento: {len(pcd.points):,} -> {max_points:,} punti...")
-        idx = np.random.choice(len(pcd.points), max_points, replace=False)
+    # 3. Rifinitura numerica deterministica (con seed fisso per riproducibilità assoluta)
+    if len(pcd.points) > target_pts:
+        idx = np.random.choice(len(pcd.points), target_pts, replace=False)
         pcd = pcd.select_by_index(idx)
 
-    print(f"Nuvola pronta: {len(pcd.points):,} punti")
+    print(f"Nuvola pronta per elaborazione: {len(pcd.points):,} punti")
     return pcd
 
 
@@ -139,7 +175,8 @@ def carica_nuvola(percorso: str, max_points: int = MAX_POINTS, voxel_size=VOXEL_
 def proietta_2d(pcd: o3d.geometry.PointCloud, risoluzione: int = RISOLUZIONE_PROIEZIONE):
     """
     Proietta la nuvola dall'alto (vista nadirale = piano XY) generando:
-    - immagine 2D colorata con mappa di calore Z (altezza)
+    - immagine 2D colorata con mappa di calore Z (altezza) su sfondo nero (stile PointCloud)
+    - versione RGB per SAM 2D e BGR per OpenCV
     - struttura dati per la ri-proiezione inversa 2D → 3D
     """
     print(f"\n{'='*60}")
@@ -152,7 +189,11 @@ def proietta_2d(pcd: o3d.geometry.PointCloud, risoluzione: int = RISOLUZIONE_PRO
     x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
     x_min, x_max = x.min(), x.max()
     y_min, y_max = y.min(), y.max()
-    z_min, z_max = z.min(), z.max()
+
+    # Normalizzazione robusta con percentili 1% e 99% (come in PointCloud)
+    # per evitare che singoli punti spuri schiaccino la scala cromatica
+    z_min = float(np.percentile(z, 1))
+    z_max = float(np.percentile(z, 99))
 
     delta_x = x_max - x_min
     delta_y = y_max - y_min
@@ -169,28 +210,34 @@ def proietta_2d(pcd: o3d.geometry.PointCloud, risoluzione: int = RISOLUZIONE_PRO
     u = ((x - x_min) / delta_x * (larghezza - 1)).astype(np.int32) if delta_x > 0 else np.zeros(len(x), dtype=np.int32)
     v = ((y_max - y) / delta_y * (altezza - 1)).astype(np.int32) if delta_y > 0 else np.zeros(len(y), dtype=np.int32)
 
-    # Mappa di calore Z (più alto = più luminoso) dipinta dal basso verso l'alto
-    z_norm_uint8 = ((z - z_min) / (z_max - z_min + 1e-9) * 255).astype(np.uint8)
-    immagine = np.full((altezza, larghezza, 3), 255, dtype=np.uint8)
+    # Mappa di calore Z (MAGMA): suolo/basso scuro, tronchi/alto luminoso
+    z_norm_uint8 = (np.clip((z - z_min) / (z_max - z_min + 1e-9), 0, 1) * 255).astype(np.uint8)
+
+    # Sfondo NERO ad alto contrasto (come nel progetto PointCloud)
+    immagine_bgr = np.zeros((altezza, larghezza, 3), dtype=np.uint8)
     ordine_z = np.argsort(z_norm_uint8)
     colori_jet = cv2.applyColorMap(z_norm_uint8, cv2.COLORMAP_MAGMA).squeeze()
 
-    # Disegna ogni punto con raggio > 1 per renderli ben visibili su sfondo bianco
-    raggio_punto = max(1, int(risoluzione / 500))
+    # Disegna ogni punto con raggio calibrato per chiudere micro-buchi tra punti vicini
+    raggio_punto = max(2, int(risoluzione / 350))
     for idx_pt in ordine_z:
         pt_u = int(u[idx_pt])
         pt_v = int(v[idx_pt])
         colore = (int(colori_jet[idx_pt][0]), int(colori_jet[idx_pt][1]), int(colori_jet[idx_pt][2]))
         if raggio_punto > 1:
-            cv2.circle(immagine, (pt_u, pt_v), raggio_punto, colore, -1)
+            cv2.circle(immagine_bgr, (pt_u, pt_v), raggio_punto, colore, -1)
         else:
-            immagine[pt_v, pt_u] = colore
+            immagine_bgr[pt_v, pt_u] = colore
+
+    # Converti in RGB nativo per SAM (SAM richiede RGB, cv2 produce BGR)
+    immagine_rgb = cv2.cvtColor(immagine_bgr, cv2.COLOR_BGR2RGB)
 
     # KDTree per ritrovare il punto 3D più vicino dato un pixel 2D
     kdtree_2d = KDTree(np.vstack((u, v)).T.astype(np.float32))
 
     info = {
-        "immagine": immagine,
+        "immagine": immagine_bgr,
+        "immagine_rgb": immagine_rgb,
         "kdtree_2d": kdtree_2d,
         "xyz_originale": xyz,
         "u": u, "v": v,
@@ -199,7 +246,7 @@ def proietta_2d(pcd: o3d.geometry.PointCloud, risoluzione: int = RISOLUZIONE_PRO
         "larghezza": larghezza, "altezza": altezza,
     }
 
-    print(f"Immagine 2D generata: {larghezza}x{altezza} px")
+    print(f"Immagine 2D generata: {larghezza}x{altezza} px (sfondo nero, mappa MAGMA)")
     return info
 
 
@@ -207,10 +254,17 @@ def proietta_2d(pcd: o3d.geometry.PointCloud, risoluzione: int = RISOLUZIONE_PRO
 #  STEP 3 - MODELLO 1: SAM 2D - RILEVAMENTO TRONCHI
 # ==============================================================================
 
-def rileva_tronchi_sam2d(immagine: np.ndarray, checkpoint: str = SAM2D_CHECKPOINT):
+def rileva_tronchi_sam2d(info_proiezione: dict, checkpoint: str = SAM2D_CHECKPOINT):
     """
-    Applica SAM 2D (ViT-H Automatic Mask Generator) sull'immagine nadirale.
-    Restituisce le maschere binarie filtrate per area, una per tronco rilevato.
+    Applica SAM 2D (ViT-H Automatic Mask Generator) sull'immagine nadirale RGB.
+    Implementa filtri completi per:
+    - Ordinamento per confidenza decrescente (predicted_iou)
+    - Filtro area min/max (0.4% - 12% dell'immagine totale)
+    - NMS / controllo di sovrapposizione (max 25% con maschere già accettate)
+    - Filtro colore/luminanza (elimina suolo scuro e sfondo)
+    - Filtro geometrico di elongazione PCA (rapporto asse lungo / asse corto >= 2.2)
+    - Filtro di lunghezza fisica minima in metri (>= 0.8 metri)
+    - Filtro di profondità 3D (z_range >= 0.04m per scartare suolo piatto)
     """
     print(f"\n{'='*60}")
     print("STEP 3 - Modello 1: SAM 2D - Rilevamento tronchi")
@@ -230,29 +284,98 @@ def rileva_tronchi_sam2d(immagine: np.ndarray, checkpoint: str = SAM2D_CHECKPOIN
     sam2d = sam_model_registry["vit_h"](checkpoint=checkpoint)
     sam2d.to(device=device)
 
-    h, w = immagine.shape[:2]
-    area_totale = h * w
+    immagine_rgb = info_proiezione["immagine_rgb"]
+    immagine_bgr = info_proiezione["immagine"]
+    xyz_originale = info_proiezione["xyz_originale"]
+    kdtree_2d = info_proiezione["kdtree_2d"]
+    delta_x = info_proiezione["delta_x"]
+    delta_y = info_proiezione["delta_y"]
 
+    h, w = immagine_rgb.shape[:2]
+    area_totale = h * w
+    scale_x = delta_x / w
+    scale_y = delta_y / h
+
+    # Parametri ottimizzati conformi a PointCloud
     generatore = SamAutomaticMaskGenerator(
         model=sam2d,
-        points_per_side=32,
-        pred_iou_thresh=0.88,
-        stability_score_thresh=0.92,
-        min_mask_region_area=MIN_AREA_MASCHERA,
+        points_per_side=48,
+        pred_iou_thresh=0.90,
+        stability_score_thresh=0.90,
+        min_mask_region_area=1800,
     )
 
-    print("Generazione maschere in corso...")
-    maschere_raw = generatore.generate(immagine)
+    print("Generazione maschere in corso (su immagine RGB, 48x48 griglia)...")
+    maschere_raw = generatore.generate(immagine_rgb)
     print(f"Maschere generate dal modello: {len(maschere_raw)}")
 
-    # Filtraggio: elimina maschere troppo piccole o troppo grandi (sfondo)
-    maschere_filtrate = [
-        m for m in maschere_raw
-        if MIN_AREA_MASCHERA <= m["area"] <= area_totale * MAX_AREA_MASCHERA_PERCENTUALE
-    ]
-    maschere_filtrate.sort(key=lambda m: m["area"], reverse=True)
+    # 1. Ordina le maschere in base alla confidenza decrescente (come in PointCloud)
+    maschere_raw.sort(key=lambda m: m["predicted_iou"], reverse=True)
 
-    print(f"Maschere accettate dopo filtraggio: {len(maschere_filtrate)}")
+    min_area = area_totale * MIN_AREA_PERCENTUALE
+    max_area = area_totale * MAX_AREA_PERCENTUALE
+
+    canvas_occupato = np.zeros((h, w), dtype=bool)
+    maschere_filtrate = []
+
+    for m in maschere_raw:
+        area = m["area"]
+
+        # 2. Filtro di area calibrato (0.4% - 12% dell'immagine)
+        if area < min_area or area > max_area:
+            continue
+
+        # 3. Controllo sovrapposizione (NMS): tiene la maschera a confidenza maggiore
+        sovrapposizione = np.logical_and(canvas_occupato, m["segmentation"]).sum() / area
+        if sovrapposizione > MAX_OVERLAP_SOGLIA:
+            continue
+
+        # 4. Filtro di colore/luminanza (i tronchi in MAGMA contengono pixel arancio/giallo luminosi)
+        pixel_valori = immagine_bgr[m["segmentation"]]
+        if np.mean(pixel_valori) < 30 or np.percentile(pixel_valori, 80) < 50:
+            continue
+
+        # 5. Filtro geometrico di forma: un tronco e' un cilindro allungato (PCA su pixel in coordinate metriche)
+        pixel_v, pixel_u = np.where(m["segmentation"])
+        if len(pixel_u) < 20:
+            continue
+
+        pts_m = np.vstack((pixel_u * scale_x, pixel_v * scale_y)).T
+        pts_c = pts_m - pts_m.mean(axis=0)
+        cov = np.cov(pts_c, rowvar=False)
+        eigvals, _ = np.linalg.eigh(cov)
+        std_long = np.sqrt(max(1e-6, eigvals[1]))
+        std_trans = np.sqrt(max(1e-6, eigvals[0]))
+        elongazione = std_long / std_trans
+        lunghezza_stimata = 3.5 * std_long
+
+        # Scarta macchie tonde (rocce, terreno piatto) o frammenti troppo corti (< 0.8 metri)
+        if elongazione < MIN_ELONGAZIONE or lunghezza_stimata < MIN_LUNGHEZZA_METRI:
+            continue
+
+        # 6. Filtro di rilievo 3D: campiona punti 3D nella maschera
+        if len(pixel_u) > 100:
+            sub_idx = np.random.choice(len(pixel_u), 100, replace=False)
+            pu_sub, pv_sub = pixel_u[sub_idx], pixel_v[sub_idx]
+        else:
+            pu_sub, pv_sub = pixel_u, pixel_v
+
+        pts_2d_sub = np.vstack((pu_sub, pv_sub)).T.astype(np.float32)
+        _, idx_3d = kdtree_2d.query(pts_2d_sub)
+        z_campioni = xyz_originale[idx_3d, 2]
+
+        z_std = float(np.std(z_campioni))
+        z_range = float(np.ptp(z_campioni))
+
+        if z_std < MIN_Z_STD or z_range < 0.04:
+            continue
+
+        # Maschera confermata
+        canvas_occupato = np.logical_or(canvas_occupato, m["segmentation"])
+        maschere_filtrate.append(m)
+        print(f"  Tronco accettato: area {area} ({area/area_totale*100:.2f}%) | Lunghezza ~{lunghezza_stimata:.2f}m | Elongazione {elongazione:.1f} | IoU SAM {m['predicted_iou']:.3f}")
+
+    print(f"Maschere accettate dopo filtraggio rigoroso: {len(maschere_filtrate)}")
 
     # Libera la memoria GPU del Modello 1
     del sam2d
@@ -270,7 +393,9 @@ def estrai_terna_punti_3d(maschera_binaria: np.ndarray, info_proiezione: dict):
     Data la maschera 2D di un tronco, estrae 3 punti 3D:
       - il punto centrale della maschera
       - i due punti agli estremi del tronco lungo il suo asse principale (PCA)
-    Usa la ri-proiezione inversa via KDTree 2D → punto 3D più vicino.
+    Usa percentili (12% e 88%) lungo l'asse per garantire che i prompt cadano
+    saldamente sul corpo solido del tronco e non su bordi sfocati o terreno.
+    Restituisce: (punti_3d, candidati_2d)
     """
     u_tutti = info_proiezione["u"]
     v_tutti = info_proiezione["v"]
@@ -280,7 +405,7 @@ def estrai_terna_punti_3d(maschera_binaria: np.ndarray, info_proiezione: dict):
     # Coordinate pixel dei punti nella maschera
     pixel_v, pixel_u = np.where(maschera_binaria)
     if len(pixel_u) < 10:
-        return None
+        return None, None
 
     punti_2d = np.vstack((pixel_u, pixel_v)).T.astype(np.float32)
 
@@ -295,9 +420,11 @@ def estrai_terna_punti_3d(maschera_binaria: np.ndarray, info_proiezione: dict):
     # Proiezione scalare di ogni pixel lungo l'asse
     proiezioni = punti_centrati @ asse_principale
 
-    # I due estremi: punto con proiezione minima e massima
-    idx_estremo_a = np.argmin(proiezioni)
-    idx_estremo_b = np.argmax(proiezioni)
+    # Usiamo i percentili (12% e 88%) per evitare il rumore dei bordi estremi
+    p12 = np.percentile(proiezioni, 12)
+    p88 = np.percentile(proiezioni, 88)
+    idx_estremo_a = np.argmin(np.abs(proiezioni - p12))
+    idx_estremo_b = np.argmin(np.abs(proiezioni - p88))
 
     candidati_2d = np.array([
         punti_2d[idx_estremo_a],
@@ -311,7 +438,7 @@ def estrai_terna_punti_3d(maschera_binaria: np.ndarray, info_proiezione: dict):
         _, idx_vicino = kdtree_2d.query(pt_2d)
         punti_3d.append(xyz_originale[idx_vicino])
 
-    return np.array(punti_3d)  # shape (3, 3)
+    return np.array(punti_3d), candidati_2d
 
 
 # ==============================================================================
@@ -403,12 +530,14 @@ def _snapshot_matplotlib(
     pcd_originale: o3d.geometry.PointCloud,
     colori_out: np.ndarray,
     percorso: str,
-    larghezza: int = 1280,
-    altezza: int = 720,
+    larghezza: int = 1920,
+    altezza: int = 1080,
+    prompt_punti_3d: np.ndarray = None,
 ):
     """
-    Fallback: genera uno snapshot 2D nadirale usando matplotlib quando
-    Open3D Visualizer non è disponibile (es. WSL headless senza server X).
+    Genera snapshot ad alta risoluzione (1920x1080) usando matplotlib in pura modalità CPU headless.
+    Garantisce proporzioni e visibilità dei punti identiche sia per la scena completa che per i singoli tronchi.
+    Se fornita una terna di punti prompt 3D, li evidenzia con marker chiari e targhette informative.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -416,18 +545,22 @@ def _snapshot_matplotlib(
 
     xyz = np.asarray(pcd_originale.points)
     n_punti = len(xyz)
-    # Calcola una dimensione del punto adattiva in base al numero di punti
-    if n_punti <= 15000:
-        point_size = 12.0
-    elif n_punti <= 50000:
-        point_size = 6.0
+
+    # Calibrazione adattiva della dimensione dei punti per risoluzione 1920x1080
+    if n_punti <= 20000:
+        point_size = 14.0
+    elif n_punti <= 60000:
+        point_size = 7.0
+    elif n_punti <= 120000:
+        point_size = 5.0
     else:
-        point_size = 3.0
+        point_size = max(2.0, 300000.0 / n_punti)
 
     dpi = 100
     fig, ax = plt.subplots(figsize=(larghezza / dpi, altezza / dpi), dpi=dpi)
     ax.set_facecolor("#FFFFFF")
     fig.patch.set_facecolor("#FFFFFF")
+
     # Vista dall'alto (XY), ordinata per Z crescente per sovrascrivere con i punti più alti
     ordine_z = np.argsort(xyz[:, 2])
     ax.scatter(
@@ -435,6 +568,39 @@ def _snapshot_matplotlib(
         c=colori_out[ordine_z],
         s=point_size, linewidths=0,
     )
+
+    # Se forniti i punti prompt (terna Point-SAM 3D), evidenziali visibilmente sul tronco
+    if prompt_punti_3d is not None and len(prompt_punti_3d) > 0:
+        pts_pr = np.asarray(prompt_punti_3d)
+
+        # Cerchio esterno fluorescente con bordo nero spesso
+        ax.scatter(
+            pts_pr[:, 0], pts_pr[:, 1],
+            c="#00FFFF", s=280, marker="o", edgecolors="#000000", linewidths=2.5,
+            zorder=20, label="Prompt Point-SAM",
+        )
+        # Stella interna magenta di forte contrasto
+        ax.scatter(
+            pts_pr[:, 0], pts_pr[:, 1],
+            c="#FF0055", s=90, marker="*", zorder=21,
+        )
+
+        # Targhette con etichetta leggibile
+        etichette = ["P1 (Testa)", "P2 (Centro)", "P3 (Coda)"]
+        for pt_i, pt_coord in enumerate(pts_pr):
+            lbl = etichette[pt_i] if pt_i < len(etichette) else f"P{pt_i+1}"
+            ax.annotate(
+                lbl,
+                (pt_coord[0], pt_coord[1]),
+                textcoords="offset points",
+                xytext=(12, 10),
+                fontsize=11,
+                fontweight="bold",
+                color="#000000",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="#FFFF00", edgecolor="#000000", alpha=0.9),
+                zorder=25,
+            )
+
     ax.set_aspect("equal")
     ax.axis("off")
     plt.tight_layout(pad=0)
@@ -444,33 +610,11 @@ def _snapshot_matplotlib(
 
 def _prova_visualizer_o3d(pcd_vis: o3d.geometry.PointCloud, percorso: str, larghezza: int, altezza: int) -> bool:
     """
-    Tenta di usare Open3D Visualizer in modalità offscreen.
-    Restituisce True se riesce, False altrimenti (WSL headless senza X).
+    In ambienti WSL/headless, l'inizializzazione di Open3D Visualizer con GLFW fallisce
+    a livello di driver grafico C++ provocando un SIGSEGV (codice 139) non intercettabile da Python.
+    Restituisce False per usare direttamente _snapshot_matplotlib che è affidabile e headless-safe.
     """
-    try:
-        vis = o3d.visualization.Visualizer()
-        vis.create_window(visible=False, width=larghezza, height=altezza)
-        vis.add_geometry(pcd_vis)
-        
-        opt = vis.get_render_option()
-        if opt is not None:
-            opt.background_color = np.asarray([1.0, 1.0, 1.0])
-            opt.point_size = 4.0
-
-        ctr = vis.get_view_control()
-        if ctr is not None:
-            ctr.set_front([0, 0, 1])
-            ctr.set_up([0, 1, 0])
-            ctr.set_lookat(np.asarray(pcd_vis.points).mean(axis=0))
-            ctr.set_zoom(0.5)
-        vis.poll_events()
-        vis.update_renderer()
-        vis.capture_screen_image(percorso)
-        vis.destroy_window()
-        return True
-    except Exception as e:
-        print(f"  [INFO] Open3D Visualizer non disponibile ({e}), uso matplotlib.")
-        return False
+    return False
 
 
 def salva_snapshot_tronco(
@@ -480,11 +624,11 @@ def salva_snapshot_tronco(
     idx_tronco: int,
     cartella: str,
     score: float,
+    prompt_terna_3d: np.ndarray = None,
 ):
     """
-    Salva uno snapshot 3D con il tronco segmentato evidenziato nel suo colore
-    e il resto della scena in grigio neutro chiaro.
-    Tenta Open3D Visualizer; se non disponibile (WSL headless) usa matplotlib.
+    Salva uno snapshot 3D ad alta risoluzione (1920x1080) con il tronco segmentato
+    nel suo colore, la scena in grigio e la terna di prompt 3D evidenziata.
     """
     colori_out = np.ones((len(pcd_originale.points), 3)) * 0.75  # grigio chiaro su sfondo bianco
     colori_out[maschera] = colore
@@ -495,8 +639,8 @@ def salva_snapshot_tronco(
 
     percorso = os.path.join(cartella, f"tronco_{idx_tronco:02d}_score{score:.2f}.png")
 
-    if not _prova_visualizer_o3d(pcd_vis, percorso, 1280, 720):
-        _snapshot_matplotlib(pcd_originale, colori_out, percorso, 1280, 720)
+    # Usa esattamente 1920x1080 per garantire lo stesso rapporto immagine/punti di scena_completa_segmentata
+    _snapshot_matplotlib(pcd_originale, colori_out, percorso, 1920, 1080, prompt_punti_3d=prompt_terna_3d)
 
     print(f"  Snapshot salvato: {os.path.basename(percorso)}")
 
@@ -533,16 +677,16 @@ def salva_scena_completa(
 def salva_immagine_rilevamento(
     immagine_2d: np.ndarray,
     maschere_2d: list,
-    terne_punti: list,
+    terne_2d: list,
     cartella: str,
 ):
     """
     Salva l'immagine 2D con i contorni di ogni tronco rilevato da SAM 2D
-    e le 3 terne di punti prompt evidenziate (cerchi colorati).
+    e le 3 terne di punti prompt evidenziate (cerchi colorati con bordo bianco).
     """
     overlay = immagine_2d.copy()
 
-    for i, (maschera_dict, terna) in enumerate(zip(maschere_2d, terne_punti)):
+    for i, (maschera_dict, terna) in enumerate(zip(maschere_2d, terne_2d)):
         if terna is None:
             continue
         colore_bgr = [int(c * 255) for c in TAVOLOZZA_COLORI[i % len(TAVOLOZZA_COLORI)]][::-1]
@@ -552,9 +696,17 @@ def salva_immagine_rilevamento(
         contorni, _ = cv2.findContours(contorno_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, contorni, -1, colore_bgr, 2)
 
+        # Disegna visibilmente i 3 punti prompt (estremo A, centro, estremo B)
+        for pt in terna:
+            px, py = int(round(pt[0])), int(round(pt[1]))
+            cv2.circle(overlay, (px, py), 6, (255, 255, 255), -1)
+            cv2.circle(overlay, (px, py), 4, colore_bgr, -1)
+
         # Etichetta numerica
         y_m, x_m = np.where(maschera_dict["segmentation"])
         cx, cy = int(x_m.mean()), int(y_m.mean())
+        cv2.putText(overlay, f"T{i+1}", (cx - 10, cy + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 3)
         cv2.putText(overlay, f"T{i+1}", (cx - 10, cy + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, colore_bgr, 2)
 
@@ -620,7 +772,7 @@ def main():
     # ------------------------------------------------------------------
     # STEP 3 - Modello 1: SAM 2D - Rilevamento tronchi
     # ------------------------------------------------------------------
-    maschere_2d = rileva_tronchi_sam2d(info_proj["immagine"])
+    maschere_2d = rileva_tronchi_sam2d(info_proj)
 
     if not maschere_2d:
         print("\n[ATTENZIONE] Nessun tronco rilevato dal Modello 1. Pipeline terminata.")
@@ -634,22 +786,24 @@ def main():
     print(f"{'='*60}")
 
     terne_originali = []
+    terne_2d_valide = []
     maschere_2d_valide = []
     for i, m in enumerate(maschere_2d):
-        terna = estrai_terna_punti_3d(m["segmentation"], info_proj)
-        if terna is not None:
-            terne_originali.append(terna)
+        terna_3d, terna_2d = estrai_terna_punti_3d(m["segmentation"], info_proj)
+        if terna_3d is not None:
+            terne_originali.append(terna_3d)
+            terne_2d_valide.append(terna_2d)
             maschere_2d_valide.append(m)
             print(f"  Tronco {i+1}: 3 prompt estratti (estremo A, centro, estremo B)")
         else:
-            print(f"  Tronco {i+1}: maschera troppo piccola, ignorata")
+            print(f"  Tronco {i+1}: maschera non valida, ignorata")
 
     if not terne_originali:
         print("[ATTENZIONE] Nessuna terna valida estratta. Pipeline terminata.")
         sys.exit(0)
 
     # Salva immagine 2D con rilevamenti e prompt evidenziati
-    salva_immagine_rilevamento(info_proj["immagine"], maschere_2d_valide, terne_originali, cartella_out)
+    salva_immagine_rilevamento(info_proj["immagine"], maschere_2d_valide, terne_2d_valide, cartella_out)
 
     print(f"\nTronchi validi da segmentare: {len(terne_originali)}")
 
@@ -693,7 +847,7 @@ def main():
         maschere_3d.append(maschera)
 
         colore = TAVOLOZZA_COLORI[i % len(TAVOLOZZA_COLORI)]
-        salva_snapshot_tronco(pcd, maschera, colore, i + 1, cartella_out, score)
+        salva_snapshot_tronco(pcd, maschera, colore, i + 1, cartella_out, score, prompt_terna_3d=terna_xyz)
 
     # ------------------------------------------------------------------
     # OUTPUT FINALE
